@@ -47,9 +47,14 @@ struct	Bitmap
 	int	flag;		/* flag used by X implementation of libg */
 };
 
+/* Mouse wheel "buttons", reported as a press; not held, so never in a
+ * drag.  X reports the wheel as buttons 4 (up) and 5 (down). */
+#define MOUSE_WHEELUP	8
+#define MOUSE_WHEELDOWN	16
+
 struct	Mouse
 {
-	int		buttons; /* bit array: LMR=124 */
+	int		buttons; /* bit array: LMR=124, wheel=8/16 */
 	Point		xy;
 	unsigned long	msec;
 };

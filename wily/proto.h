@@ -248,6 +248,7 @@ Bool		view_invariants	(View*v);
 
 Data*	view_data		(View*);
 View*	view_body		(View*);
+void	view_wheel		(View*, Bool up);
 Tile*		view_win			(View*);
 Tile*		view_tile			(View*);
 Text*	view_text		(View*);

@@ -362,6 +362,7 @@ Mouseaction(Widget w, XEvent *e, String *p, Cardinal *np)
 	XMotionEvent *me;
 	Gwinmouse m;
 	Mousefunc f;
+	int wheel = 0;
 
 	switch(e->type){
 	case ButtonPress:
@@ -374,6 +375,8 @@ Mouseaction(Widget w, XEvent *e, String *p, Cardinal *np)
 		case 1:	s |= Button1Mask; break;
 		case 2:	s |= Button2Mask; break;
 		case 3:	s |= Button3Mask; break;
+		case 4:	wheel = MOUSE_WHEELUP; break;
+		case 5:	wheel = MOUSE_WHEELDOWN; break;
 		}
 		break;
 	case ButtonRelease:
@@ -402,6 +405,7 @@ Mouseaction(Widget w, XEvent *e, String *p, Cardinal *np)
 	if(s & Button1Mask) m.buttons |= 1;
 	if(s & Button2Mask) m.buttons |= 2;
 	if(s & Button3Mask) m.buttons |= 4;
+	m.buttons |= wheel;
 	f = ((GwinWidget)w)->gwin.gotmouse;
 	if(f)
 		(*f)(&m);

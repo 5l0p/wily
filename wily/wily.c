@@ -9,10 +9,10 @@ static int	ncolumns = 2;
 int	tagheight;
 Tile	*wily=0;			/* encloses the whole application */
 
-char *wilytools = 	"Kill | Newcol Quit Putall wily-0.13.42 Dotfiles Font Term"; /* version */
+char *wilytools = 	"Kill | Newcol Quit Putall Font"; /* version */
 char *filetools = 	"Del Look .";
 char *dirtools = 	"Del Look ..";
-char *columntools = "Delcol New Cut Paste Snarf Anchor Split | ";
+char *columntools = "Delcol New Cut Paste Snarf Anchor Split Term | ";
 
 void
 _allocerror(char*s){
@@ -169,6 +169,12 @@ mainloop(void)
 		case Emouse:
 			lastp = e.mouse.xy;
 			mouseaction=true;
+			if (e.mouse.buttons & (MOUSE_WHEELUP|MOUSE_WHEELDOWN)) {
+				View *w = point2view(e.mouse.xy);
+				if (w)
+					view_wheel(w, (e.mouse.buttons & MOUSE_WHEELUP) != 0);
+				break;
+			}
 			if(e.mouse.buttons && (last_focus = point2view(e.mouse.xy)))
 				domouse(last_focus, &e.mouse);	
 			break;

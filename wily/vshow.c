@@ -20,6 +20,19 @@ view_linesdown(View *v, int n, Bool down) {
 	view_scroll(v, &m);
 }
 
+/* Lines moved per wheel notch */
+#define WHEEL_LINES	3
+
+/* Scroll the body of 'v's window in response to the mouse wheel */
+void
+view_wheel(View *v, Bool up)
+{
+	View *b = view_body(v);
+
+	if (b && b->scroll)
+		view_linesdown(b, WHEEL_LINES, !up);
+}
+
 void
 view_pagedown(View *v, Bool down) {
 	Mouse	m;

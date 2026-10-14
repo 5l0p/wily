@@ -96,7 +96,12 @@ args(int argc,char **argv, char **envp)
 	cursorswitch(cursor);
 	wily_init();
 
+	/* ex_init() initialises the keytab, which the terminal's event
+	 * handling depends on, so the terminal must be created after it. */
 	ex_init();
+
+	/* Default terminal, placed by findcol() like any other window */
+	builtin_term(wily->tag, "Term");
 
 	if (optind<argc) {
 		for ( ; optind < argc; optind++) {
@@ -128,12 +133,6 @@ wily_init(void)
 	view_setlastselection( wily->tag);
 	for(j=0; j< ncolumns; j++)
 		col_new(wily->tag, 0);
-
-	/* Initialize keytab for event system (needed for terminal) */
-	keytab_init();
-
-	/* Add a terminal to the rightmost column */
-	builtin_term(wily->tag, "Term");
 }
 
 /* Reshape the base tile */

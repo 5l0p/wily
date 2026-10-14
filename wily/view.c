@@ -5,54 +5,12 @@
 #include "wily.h"
 #include "view.h"
 #include <ctype.h>
+#include <string.h>
 #include <termios.h>
 #include <pty.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include "text.h"
-
-/* Helper functions for text navigation */
-static ulong
-text_linestart(Text *t, int line)
-{
-	ulong pos = 0;
-	int current_line = 0;
-	
-	while (current_line < line && pos < text_length(t)) {
-		int c;
-		Tgetcset(t, pos);
-		c = Tgetc(t);
-		if (c == -1) break;
-		if (c == NEWLINE) current_line++;
-		pos++;
-	}
-	
-	return pos;
-}
-
-static ulong
-text_nextutf(Text *t, ulong pos, int count)
-{
-	ulong result = pos;
-	int i;
-	for (i = 0; i < count && result < text_length(t); i++) {
-		if (Tgetc(t) != -1) {
-			result++;
-		} else {
-			break;
-		}
-	}
-	return result;
-}
-
-static ulong
-text_prevutf(Text *t, ulong pos)
-{
-	if (pos > 0) {
-		return pos - 1;
-	}
-	return pos;
-}
 
 static ulong
 text_endOfLine(Text *t, ulong pos)
@@ -86,227 +44,1024 @@ text_endOfLine(Text *t, ulong pos)
 
 static Rectangle nullrect = { {0,0}, {0,0}};
 
-/* Process VT100 escape sequences for terminal views */
+/* ---- VT100 / ANSI terminal emulation for terminal views ----
+ *
+ * A terminal view keeps its contents in a Text.  Outside the alternate
+ * screen the Text is the whole scrollback and the screen is its last
+ * 'rows' lines.  On the alternate screen the Text holds only the screen,
+ * starting at line 0.  Positions are character (rune) offsets; lines are
+ * found by scanning for NEWLINE.
+ */
+
+#define TERM_ESC	0x1b
+#define TERM_BEL	0x07
+#define TERM_SO		0x0e
+#define TERM_SI		0x0f
+#define TERM_NOLINE	((ulong)-1)
+#define TERM_DEFROWS	24
+#define TERM_DEFCOLS	80
+
+/* DEC special graphics character set (ESC ( 0), for bytes 0x5f..0x7e */
+static char *dec_graphics[32] = {
+	" ",		/* 5f */
+	"\xe2\x97\x86",	/* 60 diamond */
+	"\xe2\x96\x92",	/* 61 checkerboard */
+	"\xe2\x90\x89",	/* 62 HT */
+	"\xe2\x90\x8c",	/* 63 FF */
+	"\xe2\x90\x8d",	/* 64 CR */
+	"\xe2\x90\x8a",	/* 65 LF */
+	"\xc2\xb0",	/* 66 degree */
+	"\xc2\xb1",	/* 67 plus-minus */
+	"\xe2\x90\xa4",	/* 68 NL */
+	"\xe2\x90\x8b",	/* 69 VT */
+	"\xe2\x94\x98",	/* 6a lower right corner */
+	"\xe2\x94\x90",	/* 6b upper right corner */
+	"\xe2\x94\x8c",	/* 6c upper left corner */
+	"\xe2\x94\x94",	/* 6d lower left corner */
+	"\xe2\x94\xbc",	/* 6e crossing */
+	"\xe2\x8e\xba",	/* 6f scan 1 */
+	"\xe2\x8e\xbb",	/* 70 scan 3 */
+	"\xe2\x94\x80",	/* 71 horizontal line */
+	"\xe2\x8e\xbc",	/* 72 scan 7 */
+	"\xe2\x8e\xbd",	/* 73 scan 9 */
+	"\xe2\x94\x9c",	/* 74 left T */
+	"\xe2\x94\xa4",	/* 75 right T */
+	"\xe2\x94\xb4",	/* 76 bottom T */
+	"\xe2\x94\xac",	/* 77 top T */
+	"\xe2\x94\x82",	/* 78 vertical line */
+	"\xe2\x89\xa4",	/* 79 <= */
+	"\xe2\x89\xa5",	/* 7a >= */
+	"\xcf\x80",	/* 7b pi */
+	"\xe2\x89\xa0",	/* 7c not equal */
+	"\xc2\xa3",	/* 7d pound */
+	"\xc2\xb7"	/* 7e middle dot */
+};
+
+static int
+term_rows(View *v)
+{
+	return (v->term && v->term->rows > 0) ? v->term->rows : TERM_DEFROWS;
+}
+
+static int
+term_cols(View *v)
+{
+	return (v->term && v->term->cols > 0) ? v->term->cols : TERM_DEFCOLS;
+}
+
+/* Number of lines in the text: a trailing newline starts another line */
+static ulong
+term_nlines(Text *t)
+{
+	ulong n = 1;
+	int c;
+
+	Tgetcset(t, 0);
+	while ((c = Tgetc(t)) != -1)
+		if (c == NEWLINE)
+			n++;
+	return n;
+}
+
+/* Position of the first character of line 'line', or TERM_NOLINE */
+static ulong
+term_linepos(Text *t, ulong line)
+{
+	ulong pos = 0;
+	ulong len = text_length(t);
+	ulong l;
+
+	for (l = 0; l < line; l++) {
+		ulong le = text_endOfLine(t, pos);
+		if (le >= len)
+			return TERM_NOLINE;
+		pos = le + 1;
+	}
+	return pos;
+}
+
+/* Index of the line containing position 'p' */
+static ulong
+term_lineof(Text *t, ulong p)
+{
+	ulong line = 0;
+	ulong i;
+
+	Tgetcset(t, 0);
+	for (i = 0; i < p; i++) {
+		int c = Tgetc(t);
+		if (c == -1)
+			break;
+		if (c == NEWLINE)
+			line++;
+	}
+	return line;
+}
+
+/* Replace 'r' in 'v's text with the 'n' bytes of UTF-8 in 's' */
+static void
+term_put(View *v, Range r, const char *s, int n)
+{
+	char *buf;
+
+	if (n <= 0) {
+		if (RLEN(r))
+			text_replace(v->t, r, rstring(0, 0));
+		return;
+	}
+	buf = salloc(n + 1);
+	memcpy(buf, s, n);
+	buf[n] = '\0';
+	text_replaceutf(v->t, r, buf);
+	free(buf);
+}
+
+/* A string of 'n' spaces, to be freed by the caller */
+static char *
+term_blanks(ulong n)
+{
+	char *b = salloc((int)n + 1);
+	memset(b, ' ', n);
+	b[n] = '\0';
+	return b;
+}
+
+/* Overwrite 'n' characters from 'p' with spaces; the cursor is unchanged */
+static void
+term_blank(View *v, ulong p, ulong n)
+{
+	char *b;
+
+	if (n == 0)
+		return;
+	b = term_blanks(n);
+	term_put(v, range(p, p + n), b, (int)n);
+	free(b);
+}
+
+/* Place the cursor at 'p', clamped to the text */
+static void
+term_setcursor(View *v, ulong p)
+{
+	ulong len = text_length(v->t);
+	if (p > len)
+		p = len;
+	v->sel = range(p, p);
+}
+
+static ulong
+term_curline(View *v)
+{
+	return term_lineof(v->t, v->sel.p0);
+}
+
+static ulong
+term_curcol(View *v)
+{
+	return v->sel.p0 - text_startOfLine(v->t, v->sel.p0);
+}
+
+/* Index of the first line of the screen */
+static ulong
+term_screentop(View *v)
+{
+	ulong n;
+
+	if (v->term->altscreen)
+		return 0;
+	n = term_nlines(v->t);
+	return (n > (ulong)term_rows(v)) ? n - term_rows(v) : 0;
+}
+
+/* Position of the first character of the screen */
+static ulong
+term_screenstart(View *v)
+{
+	ulong p = term_linepos(v->t, term_screentop(v));
+	return (p == TERM_NOLINE) ? text_length(v->t) : p;
+}
+
+/* Scroll region as absolute line numbers, inclusive */
+static void
+term_region(View *v, ulong *top, ulong *bot)
+{
+	ulong st = term_screentop(v);
+	int t = v->term->top ? v->term->top : 1;
+	int b = v->term->bottom ? v->term->bottom : term_rows(v);
+
+	*top = st + t - 1;
+	*bot = st + b - 1;
+}
+
+/* Make sure line 'line' exists, adding newlines at the end if needed */
+static void
+term_pad(View *v, ulong line)
+{
+	ulong n = term_nlines(v->t);
+
+	for (; n <= line; n++)
+		term_put(v, range(text_length(v->t), text_length(v->t)), "\n", 1);
+}
+
+/* Put the cursor at column 'col' of the line starting at 'ls'.  A real
+ * terminal lets the cursor move into blank cells past the end of the text,
+ * so the line is padded with spaces when needed.
+ */
+static void
+term_gotocol(View *v, ulong ls, ulong col)
+{
+	ulong le = text_endOfLine(v->t, ls);
+	ulong len = le - ls;
+	ulong cols = term_cols(v);
+
+	if (col > cols - 1)
+		col = cols - 1;
+	if (col > len) {
+		char *b = term_blanks(col - len);
+		term_put(v, range(le, le), b, (int)(col - len));
+		free(b);
+	}
+	term_setcursor(v, ls + col);
+}
+
+/* Put the cursor at column 'col' of line 'line', creating lines as needed */
+static void
+term_gotoline(View *v, ulong line, ulong col)
+{
+	term_pad(v, line);
+	term_gotocol(v, term_linepos(v->t, line), col);
+}
+
+
+/* Insert a blank line before line 'line' */
+static void
+term_insline(View *v, ulong line)
+{
+	ulong p;
+
+	if (line > 0)
+		term_pad(v, line - 1);
+	p = term_linepos(v->t, line);
+	if (p == TERM_NOLINE)
+		p = text_length(v->t);
+	term_put(v, range(p, p), "\n", 1);
+}
+
+/* Delete line 'line', including its newline */
+static void
+term_delline(View *v, ulong line)
+{
+	ulong len = text_length(v->t);
+	ulong p = term_linepos(v->t, line);
+	ulong le;
+
+	if (p == TERM_NOLINE)
+		return;
+	le = text_endOfLine(v->t, p);
+	if (le < len)
+		term_put(v, range(p, le + 1), "", 0);	/* line and its newline */
+	else if (p > 0)
+		term_put(v, range(p - 1, len), "", 0);	/* last line: take the newline before it */
+	else
+		term_put(v, range(0, len), "", 0);
+}
+
+/* Scroll the region [top,bot] up one line: blank line appears at bot */
+static void
+term_scrollup(View *v, ulong top, ulong bot)
+{
+	term_delline(v, top);
+	term_insline(v, bot);
+}
+
+/* Scroll the region [top,bot] down one line: blank line appears at top */
+static void
+term_scrolldown(View *v, ulong top, ulong bot)
+{
+	term_insline(v, top);
+	term_delline(v, bot + 1);
+}
+
+/* Cursor up or down 'count' lines, stopping at the scroll region or
+ * the edge of the screen.  Column is kept.
+ */
+static void
+term_vmove(View *v, int delta, ulong count)
+{
+	ulong top, bot, line, col, target;
+	ulong st = term_screentop(v);
+	ulong scrbot = st + term_rows(v) - 1;
+
+	term_region(v, &top, &bot);
+	line = term_curline(v);
+	col = term_curcol(v);
+	if (delta < 0) {
+		ulong lower = (line >= top && line <= bot) ? top : st;
+		if (line <= lower)
+			target = line;
+		else if (line - lower >= count)
+			target = line - count;
+		else
+			target = lower;
+	} else {
+		ulong upper = (line >= top && line <= bot) ? bot : scrbot;
+		if (line >= upper)
+			target = line;
+		else if (upper - line >= count)
+			target = line + count;
+		else
+			target = upper;
+	}
+	term_gotoline(v, target, col);
+}
+
+/* Cursor left or right 'count' characters, staying on the line */
+static void
+term_hmove(View *v, int delta, ulong count)
+{
+	ulong ls = text_startOfLine(v->t, v->sel.p0);
+	ulong col = term_curcol(v);
+
+	if (delta > 0)
+		term_gotocol(v, ls, col + count);
+	else
+		term_gotocol(v, ls, (col < count) ? 0 : col - count);
+}
+
+/* Line feed (LF) and index (IND): down a line, scrolling at the bottom */
+static void
+term_linefeed(View *v)
+{
+	TermState *ts = v->term;
+
+	if (!ts->altscreen && ts->top == 0 && ts->bottom == 0) {
+		/* normal screen: the text grows downwards */
+		ulong p = v->sel.p0;
+		ulong eol = text_endOfLine(v->t, p);
+
+		if (eol >= text_length(v->t)) {
+			term_put(v, range(eol, eol), "\n", 1);
+			term_setcursor(v, eol + 1);
+		} else {
+			term_gotoline(v, term_curline(v) + 1, term_curcol(v));
+		}
+	} else {
+		ulong top, bot, line = term_curline(v);
+		term_region(v, &top, &bot);
+		if (line == bot) {
+			term_scrollup(v, top, bot);
+			term_gotoline(v, line, term_curcol(v));
+		} else {
+			term_vmove(v, 1, 1);
+		}
+	}
+}
+
+/* Reverse index (RI): up a line, scrolling at the top */
+static void
+term_reverseindex(View *v)
+{
+	ulong top, bot, line;
+
+	term_region(v, &top, &bot);
+	line = term_curline(v);
+	if (line == top) {
+		term_scrolldown(v, top, bot);
+		term_gotoline(v, line, term_curcol(v));
+	} else {
+		term_vmove(v, -1, 1);
+	}
+}
+
+/* Number of bytes taken by the first 'k' characters of 's' */
+static int
+term_byteoffset(const char *s, int n, ulong k)
+{
+	int i = 0;
+	ulong count;
+
+	for (count = 0; count < k && i < n; count++) {
+		i++;
+		while (i < n && ((unsigned char)s[i] & 0xC0) == 0x80)
+			i++;
+	}
+	return i;
+}
+
+/* Number of characters in a UTF-8 buffer */
+static ulong
+term_nrunes(const char *s, int n)
+{
+	ulong count = 0;
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (((unsigned char)s[i] & 0xC0) != 0x80)
+			count++;
+	return count;
+}
+
+/* Write 'n' bytes at the cursor, overwriting, and wrapping at the right
+ * margin (autowrap).  The line is never made longer than the screen.
+ */
+static void
+term_write(View *v, const char *s, int n)
+{
+	int cols = term_cols(v);
+
+	while (n > 0) {
+		ulong pos = v->sel.p0;
+		ulong col = term_curcol(v);
+		ulong k, over, eol;
+		int bytes;
+
+		if (col >= (ulong)cols) {
+			term_linefeed(v);
+			term_setcursor(v, text_startOfLine(v->t, v->sel.p0));
+			continue;
+		}
+		k = term_nrunes(s, n);
+		if (k > (ulong)cols - col)
+			k = (ulong)cols - col;
+		if (k == 0)
+			k = 1;	/* stray continuation bytes */
+		bytes = term_byteoffset(s, n, k);
+
+		eol = text_endOfLine(v->t, pos);
+		over = eol - pos;
+		if (over > k)
+			over = k;
+		term_put(v, range(pos, pos + over), s, bytes);
+		term_setcursor(v, pos + k);
+
+		s += bytes;
+		n -= bytes;
+	}
+}
+
+/* Insert 'n' blanks at the cursor, pushing the rest of the line right */
+static void
+term_ich(View *v, ulong n)
+{
+	ulong p = v->sel.p0;
+	ulong ls = text_startOfLine(v->t, p);
+	ulong cols = term_cols(v);
+	ulong le;
+
+	if (n > cols)
+		n = cols;
+	if (n > 0) {
+		char *b = term_blanks(n);
+		term_put(v, range(p, p), b, (int)n);
+		free(b);
+	}
+	/* keep the line within the screen width */
+	le = text_endOfLine(v->t, p);
+	if (le - ls > cols)
+		term_put(v, range(ls + cols, le), "", 0);
+	term_setcursor(v, p);
+}
+
+/* Delete 'n' characters at the cursor, pulling the rest of the line left */
+static void
+term_dch(View *v, ulong n)
+{
+	ulong p = v->sel.p0;
+	ulong le = text_endOfLine(v->t, p);
+
+	if (n > le - p)
+		n = le - p;
+	term_put(v, range(p, p + n), "", 0);
+	term_setcursor(v, p);
+}
+
+/* Erase 'n' characters from the cursor, without moving anything */
+static void
+term_ech(View *v, ulong n)
+{
+	ulong p = v->sel.p0;
+	ulong le = text_endOfLine(v->t, p);
+
+	if (n > le - p)
+		n = le - p;
+	term_blank(v, p, n);
+	term_setcursor(v, p);
+}
+
+/* Insert 'n' blank lines at the cursor line, within the scroll region */
+static void
+term_insertlines(View *v, ulong n)
+{
+	ulong top, bot, line = term_curline(v);
+	ulong k;
+
+	term_region(v, &top, &bot);
+	if (line < top || line > bot)
+		return;
+	for (k = 0; k < n; k++) {
+		term_delline(v, bot);
+		term_insline(v, line);
+	}
+	term_gotoline(v, line, 0);
+}
+
+/* Delete 'n' lines at the cursor line, within the scroll region */
+static void
+term_deletelines(View *v, ulong n)
+{
+	ulong top, bot, line = term_curline(v);
+	ulong k;
+
+	term_region(v, &top, &bot);
+	if (line < top || line > bot)
+		return;
+	for (k = 0; k < n; k++) {
+		term_delline(v, line);
+		term_insline(v, bot);
+	}
+	term_gotoline(v, line, 0);
+}
+
+/* Erase in display (ED).  Erasing keeps the layout, so the screen
+ * still has all its lines afterwards.
+ */
+static void
+term_erase_display(View *v, int mode)
+{
+	ulong p = v->sel.p0;
+	ulong len = text_length(v->t);
+	ulong s0 = term_screenstart(v);
+
+	switch (mode) {
+	case 1:		/* start of screen to cursor */
+		if (p > s0)
+			term_blank(v, s0, p - s0);
+		break;
+	case 2:		/* whole screen */
+		term_put(v, range(s0, len), "", 0);
+		if (p > s0)
+			term_setcursor(v, s0);
+		break;
+	case 3:		/* whole screen and scrollback */
+		term_put(v, range(0, len), "", 0);
+		term_setcursor(v, 0);
+		break;
+	default:	/* cursor to end of screen */
+		term_put(v, range(p, len), "", 0);
+		term_setcursor(v, p);
+		break;
+	}
+}
+
+/* Erase in line (EL) */
+static void
+term_erase_line(View *v, int mode)
+{
+	ulong p = v->sel.p0;
+	ulong ls = text_startOfLine(v->t, p);
+	ulong le = text_endOfLine(v->t, p);
+
+	switch (mode) {
+	case 1:		/* start of line to cursor */
+		term_blank(v, ls, p - ls);
+		break;
+	case 2:		/* whole line */
+		term_blank(v, ls, le - ls);
+		break;
+	default:	/* cursor to end of line */
+		term_put(v, range(p, le), "", 0);
+		term_setcursor(v, p);
+		break;
+	}
+}
+
+/* Switch between the normal and the alternate screen */
+static void
+term_altscreen(View *v, int on)
+{
+	TermState *ts = v->term;
+	Range all;
+
+	if (on == ts->altscreen)
+		return;
+	all = text_all(v->t);
+	if (on) {
+		ts->altsave = text_duputf(v->t, all);
+		ts->altcursor = v->sel.p0;
+		ts->altscreen = 1;
+		ts->top = ts->bottom = 0;
+		term_put(v, all, "", 0);
+		term_setcursor(v, 0);
+	} else {
+		int n = ts->altsave ? (int)strlen(ts->altsave) : 0;
+		term_put(v, all, ts->altsave ? ts->altsave : "", n);
+		free(ts->altsave);
+		ts->altsave = 0;
+		ts->altscreen = 0;
+		ts->top = ts->bottom = 0;
+		term_setcursor(v, ts->altcursor);
+	}
+}
+
+/* Send 's' to the child process, as if typed */
+static void
+term_reply(View *v, const char *s)
+{
+	if (v->ptyfd >= 0 && write(v->ptyfd, s, strlen(s)) < 0)
+		return;
+}
+
+/* Dispatch a complete CSI sequence.  'priv' is the private marker
+ * ('?' etc.) or 0.
+ */
+static void
+term_csi(View *v, int priv, int *params, int np, int final)
+{
+	TermState *ts = v->term;
+	int p0 = (np > 0) ? params[0] : 0;
+	int a = (p0 > 0) ? p0 : 1;	/* default count / row */
+	ulong st, top, bot;
+	int i;
+
+	if (priv == '?') {
+		if (final == 'h' || final == 'l')
+			for (i = 0; i < np; i++)
+				if (params[i] == 47 || params[i] == 1047 || params[i] == 1049)
+					term_altscreen(v, final == 'h');
+		return;	/* other DEC private modes are accepted and ignored */
+	}
+	if (priv)
+		return;
+
+	switch (final) {
+	case 'A':	/* CUU */
+		term_vmove(v, -1, a);
+		break;
+	case 'B':	/* CUD */
+	case 'e':
+		term_vmove(v, 1, a);
+		break;
+	case 'C':	/* CUF */
+	case 'a':
+		term_hmove(v, 1, a);
+		break;
+	case 'D':	/* CUB */
+		term_hmove(v, -1, a);
+		break;
+	case 'E':	/* CNL */
+		term_vmove(v, 1, a);
+		term_setcursor(v, text_startOfLine(v->t, v->sel.p0));
+		break;
+	case 'F':	/* CPL */
+		term_vmove(v, -1, a);
+		term_setcursor(v, text_startOfLine(v->t, v->sel.p0));
+		break;
+	case 'G':	/* CHA */
+	case '`':
+		term_gotoline(v, term_curline(v), a - 1);
+		break;
+	case 'd':	/* VPA */
+		st = term_screentop(v);
+		term_gotoline(v, st + a - 1, term_curcol(v));
+		break;
+	case 'H':	/* CUP */
+	case 'f': {	/* HVP */
+		int col = (np > 1 && params[1] > 0) ? params[1] : 1;
+		st = term_screentop(v);
+		term_gotoline(v, st + a - 1, col - 1);
+		break;
+	}
+	case 'J':	/* ED */
+		term_erase_display(v, p0);
+		break;
+	case 'K':	/* EL */
+		term_erase_line(v, p0);
+		break;
+	case '@':	/* ICH */
+		term_ich(v, a);
+		break;
+	case 'P':	/* DCH */
+		term_dch(v, a);
+		break;
+	case 'X':	/* ECH */
+		term_ech(v, a);
+		break;
+	case 'L':	/* IL */
+		term_insertlines(v, a);
+		break;
+	case 'M':	/* DL */
+		term_deletelines(v, a);
+		break;
+	case 'S':	/* SU: scroll region up */
+		term_region(v, &top, &bot);
+		for (i = 0; i < a; i++)
+			term_scrollup(v, top, bot);
+		break;
+	case 'T':	/* SD: scroll region down */
+		term_region(v, &top, &bot);
+		for (i = 0; i < a; i++)
+			term_scrolldown(v, top, bot);
+		break;
+	case 'r': {	/* DECSTBM */
+		int rows = term_rows(v);
+		int t = (np > 0 && params[0] > 0) ? params[0] : 1;
+		int b = (np > 1 && params[1] > 0) ? params[1] : rows;
+		if (b > rows)
+			b = rows;
+		if (t >= b) {
+			ts->top = ts->bottom = 0;
+		} else if (t == 1 && b == rows) {
+			ts->top = ts->bottom = 0;
+		} else {
+			ts->top = t;
+			ts->bottom = b;
+		}
+		term_gotoline(v, term_screentop(v), 0);
+		break;
+	}
+	case 's':	/* SCOSC */
+		ts->savedline = term_curline(v);
+		ts->savedcol = term_curcol(v);
+		break;
+	case 'u':	/* SCORC */
+		term_gotoline(v, ts->savedline, ts->savedcol);
+		break;
+	case 'n':	/* DSR */
+		if (p0 == 5) {
+			term_reply(v, "\033[0n");
+		} else if (p0 == 6) {
+			char buf[32];
+			sprintf(buf, "\033[%lu;%luR",
+				term_curline(v) - term_screentop(v) + 1,
+				term_curcol(v) + 1);
+			term_reply(v, buf);
+		}
+		break;
+	case 'c':	/* DA: report a VT100 with advanced video */
+		if (p0 == 0)
+			term_reply(v, "\033[?1;2c");
+		break;
+	default:
+		/* SGR (m), modes (h/l) and anything else: accepted and ignored,
+		 * since the view has no colours */
+		break;
+	}
+}
+
+/* Handle the escape sequence starting at s[i] == ESC.  Returns the index
+ * of the first byte after it, or -1 if the sequence is incomplete.
+ */
+static int
+term_escape(View *v, const char *s, int n, int i)
+{
+	TermState *ts = v->term;
+
+	i++;	/* skip ESC */
+	if (i >= n)
+		return -1;
+
+	switch (s[i]) {
+	case '[': {	/* CSI */
+		int priv = 0;
+		int params[16];
+		int np = 0;
+		int cur = 0;
+		int have = 0;
+		int final;
+
+		i++;
+		if (i < n && (s[i] == '?' || s[i] == '>' || s[i] == '<' || s[i] == '=')) {
+			priv = s[i];
+			i++;
+		}
+		while (i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == ';' || s[i] == ':')) {
+			if (s[i] == ';' || s[i] == ':') {
+				if (np < 16)
+					params[np++] = have ? cur : 0;
+				cur = 0;
+				have = 0;
+			} else {
+				if (cur < 100000)
+					cur = cur * 10 + (s[i] - '0');
+				have = 1;
+			}
+			i++;
+		}
+		if ((have || np > 0) && np < 16)
+			params[np++] = cur;
+		while (i < n && s[i] >= 0x20 && s[i] <= 0x2f)	/* intermediates */
+			i++;
+		if (i >= n)
+			return -1;
+		final = (unsigned char)s[i];
+		if (final < 0x20)
+			return i;	/* control character: abandon the sequence */
+		i++;
+		if (final >= 0x40 && final <= 0x7e)
+			term_csi(v, priv, params, np, final);
+		return i;
+	}
+	case ']': {	/* OSC: skip until BEL or ST (ESC \) */
+		i++;
+		while (i < n) {
+			if (s[i] == TERM_BEL)
+				return i + 1;
+			if (s[i] == TERM_ESC && i + 1 < n && s[i + 1] == '\\')
+				return i + 2;
+			i++;
+		}
+		return -1;
+	}
+	case '(':	/* character set designation */
+	case ')': {
+		if (i + 1 >= n)
+			return -1;
+		if (s[i] == '(')
+			ts->g[0] = (s[i + 1] == '0');
+		else
+			ts->g[1] = (s[i + 1] == '0');
+		return i + 2;
+	}
+	case '*':
+	case '+':
+	case '#':
+	case '%':
+		if (i + 1 >= n)
+			return -1;
+		return i + 2;
+	case 'D':	/* IND */
+		term_linefeed(v);
+		return i + 1;
+	case 'M':	/* RI */
+		term_reverseindex(v);
+		return i + 1;
+	case 'E':	/* NEL */
+		term_linefeed(v);
+		term_setcursor(v, text_startOfLine(v->t, v->sel.p0));
+		return i + 1;
+	case '7':	/* DECSC */
+		ts->savedline = term_curline(v);
+		ts->savedcol = term_curcol(v);
+		return i + 1;
+	case '8':	/* DECRC */
+		term_gotoline(v, ts->savedline, ts->savedcol);
+		return i + 1;
+	default:
+		/* ESC = and ESC > (keypad modes), ESC c, etc.: ignored */
+		return i + 1;
+	}
+}
+
+/* Length of an incomplete UTF-8 sequence at the end of s[start..n), or
+ * n if there is none.  Its bytes are held over until the next read.
+ */
+static int
+term_utf8tail(const char *s, int start, int n)
+{
+	int j;
+
+	for (j = n - 1; j >= start && j >= n - 4; j--) {
+		unsigned char c = (unsigned char)s[j];
+		if ((c & 0xC0) != 0x80) {
+			int need;
+			if (c < 0xC0)
+				need = 1;
+			else if (c < 0xE0)
+				need = 2;
+			else if (c < 0xF0)
+				need = 3;
+			else
+				need = 4;
+			return (j + need > n) ? j : n;
+		}
+	}
+	return n;
+}
+
+/* Process 'n' bytes of pty output.  Returns how many bytes were used;
+ * the rest is an incomplete sequence to be processed with the next read.
+ */
+static int
+term_process(View *v, const char *s, int n)
+{
+	TermState *ts = v->term;
+	int i = 0;
+
+	while (i < n) {
+		unsigned char c = (unsigned char)s[i];
+
+		if (c == TERM_ESC) {
+			int r = term_escape(v, s, n, i);
+			if (r < 0)
+				return i;
+			i = r;
+		} else if (c == '\r') {
+			term_setcursor(v, text_startOfLine(v->t, v->sel.p0));
+			i++;
+		} else if (c == '\n') {
+			term_linefeed(v);
+			i++;
+		} else if (c == '\b') {
+			ulong p = v->sel.p0;
+			if (p > text_startOfLine(v->t, p))
+				term_setcursor(v, p - 1);
+			i++;
+		} else if (c == '\t') {
+			ulong col = term_curcol(v);
+			int spaces = 8 - (int)(col % 8);
+			term_write(v, "        ", spaces);
+			i++;
+		} else if (c == TERM_SO) {
+			ts->shift = 1;
+			i++;
+		} else if (c == TERM_SI) {
+			ts->shift = 0;
+			i++;
+		} else if (c < 0x20 || c == 0x7f) {
+			/* BEL and other control characters: ignored */
+			i++;
+		} else if (ts->g[ts->shift] && c >= 0x5f && c <= 0x7e) {
+			char *m = dec_graphics[c - 0x5f];
+			term_write(v, m, (int)strlen(m));
+			i++;
+		} else {
+			/* run of printable bytes (including UTF-8) */
+			int start = i;
+			int gfx = ts->g[ts->shift];
+			int end;
+
+			while (i < n) {
+				unsigned char d = (unsigned char)s[i];
+				if (d < 0x20 || d == 0x7f)
+					break;
+				if (gfx && d >= 0x5f && d <= 0x7e)
+					break;
+				i++;
+			}
+			end = (i == n) ? term_utf8tail(s, start, n) : i;
+			term_write(v, s + start, end - start);
+			if (end < i)
+				return end;	/* incomplete UTF-8: keep it for the next read */
+			i = end;
+		}
+	}
+	return n;
+}
+
+/* Process pty output for a terminal view.  Bytes left over from an
+ * incomplete sequence in the previous read are prepended.
+ */
 static void
 process_vt100(View *v, char *s, int n)
 {
-	char	*buf;
-	int		bufsize;
-	int		i, j;
-	
-	/* Allocate buffer for processed text (worst case: no escape sequences) */
-	bufsize = n * UTFmax + 1;
-	buf = salloc(bufsize);
-	
-	/* Process the input, stripping/handling escape sequences */
-	for (i = 0, j = 0; i < n && j < bufsize - 1; ) {
-		if (s[i] == '\033') {  /* ESC character */
-			/* Handle escape sequences */
-			i++;  /* skip ESC */
-			if (i < n && s[i] == '[') {  /* CSI sequence */
-				i++;  /* skip '[' */
-				/* Parse parameters */
-				int params[16];
-				int nparams = 0;
-				char param_buf[16];
-				int p = 0;
-				
-				while (i < n && nparams < 16) {
-					if (s[i] >= '0' && s[i] <= '9') {
-						param_buf[p++] = s[i++];
-						if (p >= 15) p = 15;
-					} else if (s[i] == ';' && p > 0) {
-						param_buf[p] = '\0';
-						params[nparams++] = atoi(param_buf);
-						p = 0;
-						i++;
-					} else if (s[i] == ';' && p == 0) {
-						params[nparams++] = 0;
-						i++;
-					} else {
-						break;
-					}
-				}
-				if (p > 0) {
-					param_buf[p] = '\0';
-					params[nparams++] = atoi(param_buf);
-				}
-				
-				if (i < n) {
-					char final = s[i++];
-					
-					switch (final) {
-					case 'H':  /* Cursor Position (CUP) */
-					case 'f':  /* Horizontal and Vertical Position (HVP) */
-						/* Move cursor to row, col (1-indexed) */
-						{
-							int row = (nparams > 0 && params[0] > 0) ? params[0] - 1 : 0;
-							int col = (nparams > 1 && params[1] > 0) ? params[1] - 1 : 0;
-							ulong pos = text_linestart(v->t, row);
-							if (col > 0) {
-								pos = text_nextutf(v->t, pos, col);
-							}
-							v->sel = range(pos, pos);
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'J':  /* Erase in Display (ED) */
-						{
-							int param = (nparams > 0) ? params[0] : 0;
-							if (param == 2 || param == 3) {
-								/* Clear entire screen and scrollback */
-								text_replace(v->t, text_all(v->t), rstring(0, 0));
-							} else if (param == 1) {
-								/* Clear from start to cursor */
-								text_replace(v->t, range(0, v->sel.p0), rstring(0, 0));
-							} else {
-								/* Clear from cursor to end (default) */
-								text_replace(v->t, range(v->sel.p0, text_length(v->t)), rstring(0, 0));
-							}
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'K':  /* Erase in Line (EL) */
-						{
-							int param = (nparams > 0) ? params[0] : 0;
-							ulong line_start = text_startOfLine(v->t, v->sel.p0);
-							ulong line_end = text_endOfLine(v->t, v->sel.p0);
-							if (param == 1) {
-								/* Clear from start of line to cursor */
-								text_replace(v->t, range(line_start, v->sel.p0), rstring(0, 0));
-							} else if (param == 2) {
-								/* Clear entire line */
-								text_replace(v->t, range(line_start, line_end), rstring(0, 0));
-							} else {
-								/* Clear from cursor to end of line (default) */
-								text_replace(v->t, range(v->sel.p0, line_end), rstring(0, 0));
-							}
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'm':  /* Select Graphic Rendition (SGR) - colors, bold, etc. */
-						/* Strip all SGR sequences - we don't support colors */
-						break;
-						
-					case 'A':  /* Cursor Up (CUU) */
-						{
-							int nlines = (nparams > 0 && params[0] > 0) ? params[0] : 1;
-							ulong pos = v->sel.p0;
-							for (int k = 0; k < nlines; k++) {
-								pos = text_nl(v->t, pos, -1);
-							}
-							v->sel = range(pos, pos);
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'B':  /* Cursor Down (CUD) */
-						{
-							int nlines = (nparams > 0 && params[0] > 0) ? params[0] : 1;
-							ulong pos = v->sel.p0;
-							for (int k = 0; k < nlines; k++) {
-								pos = text_nl(v->t, pos, 1);
-							}
-							v->sel = range(pos, pos);
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'C':  /* Cursor Forward (CUF) */
-						{
-							int ncols = (nparams > 0 && params[0] > 0) ? params[0] : 1;
-							ulong pos = text_nextutf(v->t, v->sel.p0, ncols);
-							v->sel = range(pos, pos);
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 'D':  /* Cursor Backward (CUB) */
-						{
-							int ncols = (nparams > 0 && params[0] > 0) ? params[0] : 1;
-							ulong pos = v->sel.p0;
-							for (int k = 0; k < ncols; k++) {
-								if (pos > 0) pos = text_prevutf(v->t, pos);
-							}
-							v->sel = range(pos, pos);
-							view_show(v, v->sel);
-						}
-						break;
-						
-					case 's':  /* Save Cursor Position (SCP) */
-						/* Save cursor position - store in view if needed */
-						break;
-						
-					case 'u':  /* Restore Cursor Position (RCP) */
-						/* Restore cursor position */
-						break;
-						
-					case 'h':  /* Set Mode (SM) */
-					case 'l':  /* Reset Mode (RM) */
-						/* Handle modes like alternate screen buffer, etc. */
-						/* For alternate screen (1049, 47), we'd need to save/restore buffer */
-						break;
-						
-					case 'c':  /* Device Attributes (DA) */
-						/* Ignore */
-						break;
-						
-					case 'n':  /* Device Status Report (DSR) */
-						/* Ignore */
-						break;
-						
-					case 'r':  /* Set Scrolling Region (DECSTBM) */
-						/* Ignore for now */
-						break;
-						
-					default:
-						/* Unhandled CSI sequence - skip it */
-						break;
-					}
-				}
-			} else if (i < n && s[i] == ']') {  /* OSC sequence */
-				i++;  /* skip ']' */
-				/* Skip until ST (ESC \) or BEL */
-				while (i < n) {
-					if (s[i] == '\033' && i + 1 < n && s[i + 1] == '\\') {
-						i += 2;
-						break;
-					} else if (s[i] == '\007') {  /* BEL */
-						i++;
-						break;
-					} else {
-						i++;
-					}
-				}
-			} else if (i < n && (s[i] == '7' || s[i] == '8')) {  /* DECSC/DECRC - save/restore cursor */
-				i++;
-			} else if (i < n && (s[i] == 'D' || s[i] == 'E' || s[i] == 'M')) {  /* Index, Next Line, Reverse Index */
-				/* Simple cursor movements */
-				i++;
-			} else {
-				/* Other ESC sequences - skip one character */
-				if (i < n) i++;
-			}
-		} else {
-			/* Copy regular character */
-			int k;
-			for (k = 0; k < UTFmax && i + k < n && j + k < bufsize - 1; k++) {
-				buf[j + k] = s[i + k];
-			}
-			j += k;
-			i += k;
-		}
-	}
-	buf[j] = '\0';
-	
-	/* Insert the processed text */
-	text_replaceutf(v->t, v->sel, buf);
-	view_show(v, v->sel);
-	
+	TermState *ts = v->term;
+	char *buf;
+	int total, used, left;
+
+	if (!ts)
+		return;
+	total = ts->npend + n;
+	buf = salloc(total + 1);
+	memcpy(buf, ts->pend, ts->npend);
+	memcpy(buf + ts->npend, s, n);
+	buf[total] = '\0';
+
+	used = term_process(v, buf, total);
+
+	left = total - used;
+	if (left > (int)sizeof ts->pend)
+		left = 0;	/* a runaway sequence: give up on it */
+	memcpy(ts->pend, buf + used, left);
+	ts->npend = left;
 	free(buf);
+
+	view_show(v, v->sel);
+}
+
+/* Tell the pty the size of a terminal view, so that programs such as
+ * screen and tmux lay themselves out correctly.
+ */
+void
+view_termresize(View *v)
+{
+	struct winsize ws;
+	TermState *ts = v->term;
+	int rows, cols;
+
+	if (!v->isterm || !ts || v->ptyfd < 0 || !ISVISIBLE(v))
+		return;
+	rows = v->f.maxlines;
+	cols = Dx(v->f.r) / charwidth(v->f.font, '0');
+	if (rows < 1 || cols < 1)
+		return;
+	ts->rows = rows;
+	ts->cols = cols;
+	ts->top = ts->bottom = 0;
+
+	memset(&ws, 0, sizeof ws);
+	ws.ws_row = rows;
+	ws.ws_col = cols;
+	ioctl(v->ptyfd, TIOCSWINSZ, &ws);
 }
 
 /* Store string representation of 'dot' for 'v' into 'buf'.
@@ -360,6 +1115,7 @@ view_new(Font *f, Bool istag, Text *text, Tile *tile)
 	v->autoindent = autoindent_enabled;
 	v->isterm = false;
 	v->ptyfd = -1;
+	v->term = 0;
 	text_addview(text, v);
 	v->tile = tile;
 	v->scroll = istag? 0 : scroll_alloc(b, nullrect);
@@ -379,6 +1135,11 @@ view_delete(View *v){
 	frclear(&v->f);
 	if(v->scroll)
 		free(v->scroll);
+	if (v->term) {
+		free(v->term->altsave);
+		free(v->term);
+		v->term = 0;
+	}
 	return 0;
 }
 

@@ -114,9 +114,9 @@ view_reshaped(View*v, Rectangle r) {
 
 		view_border(v, v == last_selection);
 	}
+	if (v->isterm)
+		view_termresize(v);
 }
-
-/* Return point just after the last line in 'v' */
 int
 view_lastlinepos(View*v) {
 	Frame	*f = &v->f;

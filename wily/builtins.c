@@ -231,6 +231,14 @@ builtin_term(View *v, char *arg)
 		diag(0, "Failed to create PTY: %s", strerror(errno));
 		return;
 	}
+
+	/* Emulator state, and the pty size, must be in place before the
+	 * shell starts so that it sees the right window size */
+	newv->term = calloc(1, sizeof(TermState));
+	newv->isterm = true;
+	newv->ptyfd = pty_master;
+	view_show(newv, newv->sel);
+	view_termresize(newv);
 	
 	/* Fork the shell process */
 	pid = fork();
@@ -258,7 +266,7 @@ builtin_term(View *v, char *arg)
 		}
 		
 		/* Set environment variables for terminal */
-		setenv("TERM", "dumb", 1);
+		setenv("TERM", "vt100", 1);
 		setenv("NOCOLOR", "1", 1);
 		
 		/* Execute the shell */

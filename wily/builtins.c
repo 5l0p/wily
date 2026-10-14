@@ -11,6 +11,7 @@
 #include <pty.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <stdlib.h>
 
 /* Each of these functions takes a View used as the context
  * of the command, and an argument.  The argument may be null.
@@ -255,6 +256,10 @@ builtin_term(View *v, char *arg)
 		if (pty_slave > 2) {
 			close(pty_slave);
 		}
+		
+		/* Set environment variables for terminal */
+		setenv("TERM", "dumb", 1);
+		setenv("NOCOLOR", "1", 1);
 		
 		/* Execute the shell */
 		execlp("sh", "sh", "-i", (char*)0);

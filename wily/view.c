@@ -9,6 +9,80 @@
 #include <pty.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include "text.h"
+
+/* Helper functions for text navigation */
+static ulong
+text_linestart(Text *t, int line)
+{
+	ulong pos = 0;
+	int current_line = 0;
+	
+	while (current_line < line && pos < text_length(t)) {
+		int c;
+		Tgetcset(t, pos);
+		c = Tgetc(t);
+		if (c == -1) break;
+		if (c == NEWLINE) current_line++;
+		pos++;
+	}
+	
+	return pos;
+}
+
+static ulong
+text_nextutf(Text *t, ulong pos, int count)
+{
+	ulong result = pos;
+	int i;
+	for (i = 0; i < count && result < text_length(t); i++) {
+		if (Tgetc(t) != -1) {
+			result++;
+		} else {
+			break;
+		}
+	}
+	return result;
+}
+
+static ulong
+text_prevutf(Text *t, ulong pos)
+{
+	if (pos > 0) {
+		return pos - 1;
+	}
+	return pos;
+}
+
+static ulong
+text_endOfLine(Text *t, ulong pos)
+{
+	ulong line_start = pos;
+	ulong line_end = pos;
+	
+	/* Find start of line */
+	while (line_start > 0) {
+		ulong test_pos = line_start - 1;
+		Tgetcset(t, test_pos);
+		if (Tgetc(t) == NEWLINE) {
+			line_start = test_pos + 1;
+			break;
+		}
+		line_start = test_pos;
+	}
+	
+	/* Find end of line */
+	line_end = line_start;
+	while (line_end < text_length(t)) {
+		Tgetcset(t, line_end);
+		if (Tgetc(t) == NEWLINE) {
+			break;
+		}
+		line_end++;
+	}
+	
+	return line_end;
+}
 
 static Rectangle nullrect = { {0,0}, {0,0}};
 
@@ -25,14 +99,196 @@ process_vt100(View *v, char *s, int n)
 	buf = salloc(bufsize);
 	
 	/* Process the input, stripping/handling escape sequences */
-	for (i = 0, j = 0; i < n && j < bufsize - 1; i++) {
+	for (i = 0, j = 0; i < n && j < bufsize - 1; ) {
 		if (s[i] == '\033') {  /* ESC character */
-			/* Skip the escape sequence for now - more complete handling can be added later */
-			while (i < n && (s[i] < '@' || s[i] > '~')) {
+			/* Handle escape sequences */
+			i++;  /* skip ESC */
+			if (i < n && s[i] == '[') {  /* CSI sequence */
+				i++;  /* skip '[' */
+				/* Parse parameters */
+				int params[16];
+				int nparams = 0;
+				char param_buf[16];
+				int p = 0;
+				
+				while (i < n && nparams < 16) {
+					if (s[i] >= '0' && s[i] <= '9') {
+						param_buf[p++] = s[i++];
+						if (p >= 15) p = 15;
+					} else if (s[i] == ';' && p > 0) {
+						param_buf[p] = '\0';
+						params[nparams++] = atoi(param_buf);
+						p = 0;
+						i++;
+					} else if (s[i] == ';' && p == 0) {
+						params[nparams++] = 0;
+						i++;
+					} else {
+						break;
+					}
+				}
+				if (p > 0) {
+					param_buf[p] = '\0';
+					params[nparams++] = atoi(param_buf);
+				}
+				
+				if (i < n) {
+					char final = s[i++];
+					
+					switch (final) {
+					case 'H':  /* Cursor Position (CUP) */
+					case 'f':  /* Horizontal and Vertical Position (HVP) */
+						/* Move cursor to row, col (1-indexed) */
+						{
+							int row = (nparams > 0 && params[0] > 0) ? params[0] - 1 : 0;
+							int col = (nparams > 1 && params[1] > 0) ? params[1] - 1 : 0;
+							ulong pos = text_linestart(v->t, row);
+							if (col > 0) {
+								pos = text_nextutf(v->t, pos, col);
+							}
+							v->sel = range(pos, pos);
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'J':  /* Erase in Display (ED) */
+						{
+							int param = (nparams > 0) ? params[0] : 0;
+							if (param == 2 || param == 3) {
+								/* Clear entire screen and scrollback */
+								text_replace(v->t, text_all(v->t), rstring(0, 0));
+							} else if (param == 1) {
+								/* Clear from start to cursor */
+								text_replace(v->t, range(0, v->sel.p0), rstring(0, 0));
+							} else {
+								/* Clear from cursor to end (default) */
+								text_replace(v->t, range(v->sel.p0, text_length(v->t)), rstring(0, 0));
+							}
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'K':  /* Erase in Line (EL) */
+						{
+							int param = (nparams > 0) ? params[0] : 0;
+							ulong line_start = text_startOfLine(v->t, v->sel.p0);
+							ulong line_end = text_endOfLine(v->t, v->sel.p0);
+							if (param == 1) {
+								/* Clear from start of line to cursor */
+								text_replace(v->t, range(line_start, v->sel.p0), rstring(0, 0));
+							} else if (param == 2) {
+								/* Clear entire line */
+								text_replace(v->t, range(line_start, line_end), rstring(0, 0));
+							} else {
+								/* Clear from cursor to end of line (default) */
+								text_replace(v->t, range(v->sel.p0, line_end), rstring(0, 0));
+							}
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'm':  /* Select Graphic Rendition (SGR) - colors, bold, etc. */
+						/* Strip all SGR sequences - we don't support colors */
+						break;
+						
+					case 'A':  /* Cursor Up (CUU) */
+						{
+							int nlines = (nparams > 0 && params[0] > 0) ? params[0] : 1;
+							ulong pos = v->sel.p0;
+							for (int k = 0; k < nlines; k++) {
+								pos = text_nl(v->t, pos, -1);
+							}
+							v->sel = range(pos, pos);
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'B':  /* Cursor Down (CUD) */
+						{
+							int nlines = (nparams > 0 && params[0] > 0) ? params[0] : 1;
+							ulong pos = v->sel.p0;
+							for (int k = 0; k < nlines; k++) {
+								pos = text_nl(v->t, pos, 1);
+							}
+							v->sel = range(pos, pos);
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'C':  /* Cursor Forward (CUF) */
+						{
+							int ncols = (nparams > 0 && params[0] > 0) ? params[0] : 1;
+							ulong pos = text_nextutf(v->t, v->sel.p0, ncols);
+							v->sel = range(pos, pos);
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 'D':  /* Cursor Backward (CUB) */
+						{
+							int ncols = (nparams > 0 && params[0] > 0) ? params[0] : 1;
+							ulong pos = v->sel.p0;
+							for (int k = 0; k < ncols; k++) {
+								if (pos > 0) pos = text_prevutf(v->t, pos);
+							}
+							v->sel = range(pos, pos);
+							view_show(v, v->sel);
+						}
+						break;
+						
+					case 's':  /* Save Cursor Position (SCP) */
+						/* Save cursor position - store in view if needed */
+						break;
+						
+					case 'u':  /* Restore Cursor Position (RCP) */
+						/* Restore cursor position */
+						break;
+						
+					case 'h':  /* Set Mode (SM) */
+					case 'l':  /* Reset Mode (RM) */
+						/* Handle modes like alternate screen buffer, etc. */
+						/* For alternate screen (1049, 47), we'd need to save/restore buffer */
+						break;
+						
+					case 'c':  /* Device Attributes (DA) */
+						/* Ignore */
+						break;
+						
+					case 'n':  /* Device Status Report (DSR) */
+						/* Ignore */
+						break;
+						
+					case 'r':  /* Set Scrolling Region (DECSTBM) */
+						/* Ignore for now */
+						break;
+						
+					default:
+						/* Unhandled CSI sequence - skip it */
+						break;
+					}
+				}
+			} else if (i < n && s[i] == ']') {  /* OSC sequence */
+				i++;  /* skip ']' */
+				/* Skip until ST (ESC \) or BEL */
+				while (i < n) {
+					if (s[i] == '\033' && i + 1 < n && s[i + 1] == '\\') {
+						i += 2;
+						break;
+					} else if (s[i] == '\007') {  /* BEL */
+						i++;
+						break;
+					} else {
+						i++;
+					}
+				}
+			} else if (i < n && (s[i] == '7' || s[i] == '8')) {  /* DECSC/DECRC - save/restore cursor */
 				i++;
-			}
-			if (i < n) {
-				i++;  /* Skip the final character of the escape sequence */
+			} else if (i < n && (s[i] == 'D' || s[i] == 'E' || s[i] == 'M')) {  /* Index, Next Line, Reverse Index */
+				/* Simple cursor movements */
+				i++;
+			} else {
+				/* Other ESC sequences - skip one character */
+				if (i < n) i++;
 			}
 		} else {
 			/* Copy regular character */
@@ -41,7 +297,7 @@ process_vt100(View *v, char *s, int n)
 				buf[j + k] = s[i + k];
 			}
 			j += k;
-			i += k - 1;  /* -1 because loop increments i */
+			i += k;
 		}
 	}
 	buf[j] = '\0';

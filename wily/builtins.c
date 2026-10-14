@@ -176,7 +176,7 @@ split(View *v, char *arg)
 	}
 }
 
-static void
+void
 builtin_term(View *v, char *arg)
 {
 	char	label[MAXPATH];

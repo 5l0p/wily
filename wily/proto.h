@@ -7,8 +7,8 @@ void	error(char *, ...);
 #endif
 void fatal(char*,...);
 
-/* builtins.c */
 Bool	builtin			(View *, char *, char*);
+void		builtin_term		(View *, char *);
 
 /* click.c */
 Range	text_doubleclick	(Text *, ulong);

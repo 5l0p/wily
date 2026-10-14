@@ -4,12 +4,12 @@
 
 #include "wily.h"
 #include "tile.h"
- 
+
 static int	ncolumns = 2;
 int	tagheight;
 Tile	*wily=0;			/* encloses the whole application */
 
-char *wilytools = 	"Kill | Newcol Quit Putall wily-0.13.42 Dotfiles Font "; /* version */
+char *wilytools = 	"Kill | Newcol Quit Putall wily-0.13.42 Dotfiles Font Term"; /* version */
 char *filetools = 	"Del Look .";
 char *dirtools = 	"Del Look ..";
 char *columntools = "Delcol New Cut Paste Snarf Anchor Split | ";
@@ -128,6 +128,12 @@ wily_init(void)
 	view_setlastselection( wily->tag);
 	for(j=0; j< ncolumns; j++)
 		col_new(wily->tag, 0);
+
+	/* Initialize keytab for event system (needed for terminal) */
+	keytab_init();
+
+	/* Add a terminal to the rightmost column */
+	builtin_term(wily->tag, "Term");
 }
 
 /* Reshape the base tile */

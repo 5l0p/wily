@@ -284,8 +284,8 @@ builtin_term(View *v, char *arg)
 	}
 	
 	/* Show and select the new view */
-	view_show(newv, v->sel);
-	view_select(newv, v->sel);
+	view_show(newv, newv->sel);
+	view_select(newv, newv->sel);
 }
 
 /*****************************************************

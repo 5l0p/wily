@@ -5,8 +5,53 @@
 #include "wily.h"
 #include "view.h"
 #include <ctype.h>
+#include <termios.h>
+#include <pty.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 static Rectangle nullrect = { {0,0}, {0,0}};
+
+/* Process VT100 escape sequences for terminal views */
+static void
+process_vt100(View *v, char *s, int n)
+{
+	char	*buf;
+	int		bufsize;
+	int		i, j;
+	
+	/* Allocate buffer for processed text (worst case: no escape sequences) */
+	bufsize = n * UTFmax + 1;
+	buf = salloc(bufsize);
+	
+	/* Process the input, stripping/handling escape sequences */
+	for (i = 0, j = 0; i < n && j < bufsize - 1; i++) {
+		if (s[i] == '\033') {  /* ESC character */
+			/* Skip the escape sequence for now - more complete handling can be added later */
+			while (i < n && (s[i] < '@' || s[i] > '~')) {
+				i++;
+			}
+			if (i < n) {
+				i++;  /* Skip the final character of the escape sequence */
+			}
+		} else {
+			/* Copy regular character */
+			int k;
+			for (k = 0; k < UTFmax && i + k < n && j + k < bufsize - 1; k++) {
+				buf[j + k] = s[i + k];
+			}
+			j += k;
+			i += k - 1;  /* -1 because loop increments i */
+		}
+	}
+	buf[j] = '\0';
+	
+	/* Insert the processed text */
+	text_replaceutf(v->t, v->sel, buf);
+	view_show(v, v->sel);
+	
+	free(buf);
+}
 
 /* Store string representation of 'dot' for 'v' into 'buf'.
  * if 'isLine', we want a line address, otherwise we want
@@ -57,6 +102,8 @@ view_new(Font *f, Bool istag, Text *text, Tile *tile)
 	v->next = 0;
 	v->selecting = false;
 	v->autoindent = autoindent_enabled;
+	v->isterm = false;
+	v->ptyfd = -1;
 	text_addview(text, v);
 	v->tile = tile;
 	v->scroll = istag? 0 : scroll_alloc(b, nullrect);
@@ -213,6 +260,16 @@ view_pipe(View *v, Bool *first, char *s, int n)
 
 	n = stripnulls(s, n);
 	s[n]=0;
+	
+	/*
+	 * If this is a terminal view, process VT100 escape sequences
+	 * instead of inserting raw text
+	 */
+	if (v->isterm) {
+		process_vt100(v, s, n);
+		return;
+	}
+	
 	text_replaceutf(v->t,  r,  s);
 	r = range(p0, v->sel.p1);
 

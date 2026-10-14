@@ -11,7 +11,7 @@ static void	data_opennew		(Data*, char*, char*path);
 static int		data_getdir		(Data*, char*, char*, Stat*);
 static int		data_getfile		(Data*, char*, char*, Stat*);
 static void	data_settag		(Data*, char*);
-static Data *	data_alloc		(void);
+Data *	data_alloc		(void);
 
 /*
  * Open a new 'data' to represent 'label'.  Either read 'label', or if
@@ -208,7 +208,7 @@ data_settag(Data*d, char *path) {
 	tag_set(d->tag, buf);
 }
 
-static Data *
+Data *
 data_alloc(void) {
 	Data	*d;
 	static Id id;

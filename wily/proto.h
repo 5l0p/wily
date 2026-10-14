@@ -21,15 +21,16 @@ void		col_new			(View*v, char *arg);
 void		col_del		(Tile*);
 
 /* data.c */
-Text*	data_body	(Data*);
+Data*	data_alloc		(void);
+Text*	data_body		(Data*);
 Text*	data_tag		(Data*);
-char**	data_names	(Data*d);
+char**	data_names		(Data*d);
 Bool		data_isdirty	(Data *d);
 int		data_putall	(void);
 int		data_backupall (void);
 int		data_put		(Data *d, char *path);
 int		data_del		(Data*);
-int		data_backup	(Data *d);
+int		data_backup		(Data *d);
 
 /* env.c */
 void		env_init		(char **);

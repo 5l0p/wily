@@ -25,6 +25,8 @@ struct View {
 	View			*next;	/* list of views displaying same Data */
 	Bool			selecting;	/* we're busy dragging out a selection */
 	Bool			autoindent;	/* autoindent in this view? */
+	Bool			isterm;		/* is this a terminal view? */
+	int				ptyfd;		/* PTY master fd for terminal I/O */
 };
 #define ISTAG(v) 	((v) && !(v)->scroll)
 #define ISBODY(v)	( (v) && (v)->scroll)

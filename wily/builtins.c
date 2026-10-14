@@ -4,8 +4,13 @@
 
 #include "wily.h"
 #include "view.h"
+#include "data.h"
 #include <errno.h>
 #include <ctype.h>
+#include <termios.h>
+#include <pty.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 /* Each of these functions takes a View used as the context
  * of the command, and an argument.  The argument may be null.
@@ -171,6 +176,118 @@ split(View *v, char *arg)
 	}
 }
 
+static void
+builtin_term(View *v, char *arg)
+{
+	char	label[MAXPATH];
+	Data	*d;
+	View	*newv;
+	int		pty_master, pty_slave;
+	pid_t	pid;
+
+	if (!arg || !arg[0])
+		strcpy(label, "Term");
+	else
+		strcpy(label, arg);
+	
+	/* Create a new data object */
+	d = data_alloc();
+	if (!d) {
+		diag(0, "Failed to allocate data for terminal");
+		return;
+	}
+	
+	/* Initialize text buffers */
+	d->t = text_alloc(d, true);    /* body */
+	d->tag = text_alloc(d, false); /* tag */
+	if (!d->t || !d->tag) {
+		diag(0, "Failed to allocate text buffers for terminal");
+		return;
+	}
+	
+	/* Set up the data object */
+	strcpy(d->label, label);
+	strcpy(d->cachedlabel, label);
+	d->has_stat = false;
+	d->names = 0;
+	d->backupto = 0;
+	
+	/* Create the window first - this creates the views */
+	win_new(label, d->tag, d->t);
+	
+	/* Now get the view for the body */
+	newv = text_view(d->t);
+	if (!newv) {
+		diag(0, "Failed to create view for terminal");
+		return;
+	}
+	
+	/* Initialize with empty content (like a new file) */
+	text_replace(d->t, text_all(d->t), rstring(0,0));
+	
+	/* Set up PTY for terminal I/O */
+	if (openpty(&pty_master, &pty_slave, NULL, NULL, NULL) < 0) {
+		diag(0, "Failed to create PTY: %s", strerror(errno));
+		return;
+	}
+	
+	/* Fork the shell process */
+	pid = fork();
+	if (pid < 0) {
+		diag(0, "Failed to fork process");
+		close(pty_master);
+		close(pty_slave);
+		return;
+	} else if (pid == 0) {  /* Child process */
+		/* Close the master end in child */
+		close(pty_master);
+		
+		/* Make the slave PTY the controlling terminal */
+		setsid();
+		ioctl(pty_slave, TIOCSCTTY, 1);
+		
+		/* Redirect stdin, stdout, stderr to the slave PTY */
+		dup2(pty_slave, 0);  /* stdin */
+		dup2(pty_slave, 1);  /* stdout */
+		dup2(pty_slave, 2);  /* stderr */
+		
+		/* Close the slave fd (duplicated above) */
+		if (pty_slave > 2) {
+			close(pty_slave);
+		}
+		
+		/* Execute the shell */
+		execlp("sh", "sh", "-i", (char*)0);
+		
+		/* If we get here, exec failed */
+		diag(0, "Failed to exec shell");
+		_exit(1);
+	} else {  /* Parent process */
+		/* Close the slave end in parent */
+		close(pty_slave);
+		
+		/* Store the PTY master fd in the view */
+		newv->isterm = true;
+		newv->ptyfd = pty_master;
+		
+		/* Start monitoring the PTY for output from the shell */
+		if (event_outputstart(pty_master, pid, "sh", label, newv) < 0) {
+			diag(0, "Failed to start event monitoring for PTY: %s", strerror(errno));
+			close(pty_master);
+			newv->isterm = false;
+			newv->ptyfd = -1;
+			return;
+		}
+		
+		/* Add the shell to the running processes list */
+		addrunning("sh");
+	}
+	
+	/* Show and select the new view */
+	view_show(newv, v->sel);
+	view_select(newv, v->sel);
+}
+
 /*****************************************************
 	Clear, Look act on the body of the current
 	context.
@@ -239,6 +356,7 @@ static Cmd builtins[] = {
 	{"Redo", redo},
 	{"Snarf", builtin_snarf},
 	{"Split", split},
+	{"Term", builtin_term},
 	{"Undo", undo},
 };
 

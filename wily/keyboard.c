@@ -15,6 +15,19 @@ static void		esc(View*v);
 
 void
 dokeyboard(View *v, Rune r) {
+	/* If this is a terminal view, send input to the PTY */
+	if (v->isterm && v->ptyfd > 0) {
+		char buf[8];
+		int n;
+		
+		/* Convert rune to UTF-8 bytes */
+		n = sprint(buf, "%C", r);
+		if (n > 0) {
+			write(v->ptyfd, buf, n);
+		}
+		return;
+	}
+	
 	switch(r) {
 	case 0:			addrune(v,Runeerror); break;
 
@@ -34,8 +47,8 @@ dokeyboard(View *v, Rune r) {
 	case Ctrlw:		deleteword(v); break;
 	case Esc:			esc(v); break;
 	
-	case '\n':			if(!v->scroll){tag_cr(v); break; }
-	default:			addrune(v,r);
+	case '\n':		if(!v->scroll){tag_cr(v); break; }
+	default:		addrune(v,r);
 	}
 }
 

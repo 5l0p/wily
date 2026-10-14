@@ -1,6 +1,8 @@
 /* Copyright (c) 1992 AT&T - All rights reserved. */
 #include <libc.h>
 #include <libg.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <stdio.h>
 #include "libgint.h"
 
@@ -85,7 +87,7 @@ static Font *	initfont(char *, 	XFontStruct *, char *);
 static void	reshaped(int, int, int, int);
 static void	gotchar(int);
 static void	gotmouse(Gwinmouse *);
-static int	log2(int);
+static int	ilog2(int);
 static void	pixtocolor(Pixel, XColor *);
 static Subfont	*XFontStructtoSubfont(XFontStruct *);
 static Ebuf	*ebread(Esrc *);
@@ -118,12 +120,22 @@ static XrmOptionDescRec optable[] = {
 };
 
 static int
-ioerr(Display *d)
+ioerr(Display *d, XErrorEvent *e)
 {
 	if(onerr)
 		(*onerr)("ioerr");
 	else
-		exit(1); 
+		exit(1);
+	return 0;
+}
+
+static int
+ioerr_io(Display *d)
+{
+	if(onerr)
+		(*onerr)("ioerr");
+	else
+		exit(1);
 	return 0;
 }
 
@@ -173,7 +185,7 @@ xtbinit(Errfunc f, char *class, int *pargc, char **argv, char **fallbacks)
 	XtSetArg(args[n], XtNp9fixed, &fixedname);	n++;
 	XtSetArg(args[n], XtNcomposeMod, &compose);	n++;
 	XtGetValues(widg, args, n);
-	XSetIOErrorHandler(ioerr);
+	XSetIOErrorHandler(ioerr_io);
 	XSetErrorHandler(ioerr);
 
 	if (compose < 0 || compose > 5) {
@@ -188,7 +200,7 @@ xtbinit(Errfunc f, char *class, int *pargc, char **argv, char **fallbacks)
 	pixtocolor(_fgpixel, &_fgcolor);
 	pixtocolor(_bgpixel, &_bgcolor);
 	screen.id = (int) XtWindow(widg);
-	screen.ldepth = log2(depth);
+	screen.ldepth = ilog2(depth);
 	screen.flag = SCR;
 	if(_fgpixel != 0)
 		screen.flag |= BL1;
@@ -364,7 +376,7 @@ gottimeout(XtPointer cldata, XtIntervalId *id)
 }
 
 static int
-log2(int n)
+ilog2(int n)
 {
 	int i, v;
 
@@ -653,7 +665,7 @@ estop(unsigned long key)
 {
 	int s;
 
-	s = log2(key);
+	s = ilog2(key);
 	if (!esrc[s].inuse){
 		berror("key not in use");
 	}
@@ -666,7 +678,7 @@ estoptimer(unsigned long key)
 {
 	int	s;
 
-	s = log2(key);
+	s = ilog2(key);
 	if (!esrc[s].inuse){
 		berror("key not in use");
 	}

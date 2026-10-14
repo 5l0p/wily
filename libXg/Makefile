@@ -3,7 +3,7 @@ srcdir=.
 CC=gcc
 RANLIB=ranlib
 INCLUDES=$(srcdir)/../include
-CFLAGS=-g -O -I.. -I$(INCLUDES)  -I/usr/openwin/include
+CFLAGS=-g -O -I.. -I$(INCLUDES) 
 LIB=libXg.a
 OBJS=arc.o arith.o balloc.o bitblt.o bitbltclip.o border.o bscreenrect.o\
 	circle.o clipline.o clipr.o copymasked.o cursorset.o cursorswitch.o\

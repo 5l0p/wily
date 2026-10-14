@@ -1,5 +1,7 @@
 /* Copyright (c) 1992 AT&T - All rights reserved. */
 #include <libc.h>
+#include <stdlib.h>
+#include <string.h>
 #include <libg.h>
 #include "libgint.h"
 #include <X11/Intrinsic.h>

@@ -1,6 +1,9 @@
 /* Copyright (c) 1992 AT&T - All rights reserved. */
 #include <libc.h>
 #include <libg.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "libgint.h"
 
 #define	CHUNK	4096
@@ -16,7 +19,7 @@ wrbitmapfile(int fd, Bitmap *b)
 
 	sprint(hdr, "%11d %11d %11d %11d %11d ",
 		b->ldepth, b->r.min.x, b->r.min.y, b->r.max.x, b->r.max.y);
-	if(write(fd, hdr, 5*12) != 5*12)
+	if (write(fd, hdr, 5 * 12) != 5 * 12)
 		berror("wrbitmapfile write");
 
 	px = 1<<(3-b->ldepth);	/* pixels per byte */
